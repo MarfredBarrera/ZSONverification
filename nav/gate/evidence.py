@@ -1,11 +1,13 @@
-"""Verification evidence: how readable a detection's view is.
+"""Verification evidence: detections stored per place, ranked by readability.
 
 ``view_quality``, ``mask_touches_border`` and ``MATCH_DISTANCE_M`` mirror
 basic_utils/record_episode/episode_visualization.py (``_view_quality``,
 ``_mask_touches_border``, ``COMMIT_MATCH_DISTANCE_M``), so the online step and
 the offline commit review rank views the same way.
 """
-# How far a detection may sit from a cluster's centroid and still count as a
+import math
+
+# How far a detection may sit from an object's centroid and still count as a
 # view of it.
 MATCH_DISTANCE_M = 0.75
 # A mask covering this fraction of the frame already shows the object well
@@ -28,3 +30,42 @@ def mask_touches_border(mask):
     return bool(
         binary[0].any() or binary[-1].any() or binary[:, 0].any() or binary[:, -1].any()
     )
+
+
+class EvidenceStore:
+    """Detections bucketed by the ``cell_m`` grid cell of their world centroid.
+
+    Each cell keeps its ``per_cell`` most readable views plus its newest one, so
+    one heavily observed object cannot evict the only view of another. Past
+    ``max_total`` views, the most crowded cell loses its least readable
+    non-newest view (a cell's last view is never dropped for another cell).
+    """
+
+    def __init__(self, cell_m=MATCH_DISTANCE_M, per_cell=8, max_total=256):
+        self.cell_m, self.per_cell, self.max_total = cell_m, per_cell, max_total
+        self.cells = {}
+
+    def __iter__(self):
+        for items in self.cells.values():
+            yield from items
+
+    def __len__(self):
+        return sum(len(items) for items in self.cells.values())
+
+    def add(self, item):
+        """``item`` needs "centroid" (x, y), "quality" and "step"."""
+        key = (math.floor(item["centroid"][0] / self.cell_m), math.floor(item["centroid"][1] / self.cell_m))
+        items = self.cells.setdefault(key, [])
+        items.append(item)
+        if len(items) > self.per_cell + 1:
+            self._drop_worst(items)
+        while len(self) > self.max_total:
+            crowded = max(self.cells.values(), key=len)
+            if len(crowded) < 2:
+                break
+            self._drop_worst(crowded)
+
+    @staticmethod
+    def _drop_worst(items):
+        newest = max(items, key=lambda e: e["step"])
+        items.remove(min((e for e in items if e is not newest), key=lambda e: e["quality"]))

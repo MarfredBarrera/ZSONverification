@@ -6,20 +6,28 @@ the approach that gets a clearer view first.
 
     step = ZSONStep(cfg, camera, log_dir)
     step.start_episode(run_index, scene, episode_id, label, goal_object_ids, max_episode_steps, sim)
-    step.observe(step, rgb, depth, pose, masks, scores, camera_pitch)      # after every executed step
+    reopened = step.observe(step, rgb, depth, pose, masks, scores, camera_pitch)   # after every executed step
     verdict = step.check(step, point)           # the planner believes the target is at world point (x, y)
     ... verdict.kind: ACCEPT | REJECT | DEFER | GOTO | CONTROL
     out = step.act(step, rgb, depth, pose, masks)   # while CONTROL: an action name, or the final Verdict
     counts = step.finish_episode()
 
 Objects: every target-class detection gets a world centroid (mask + depth + pose) and joins the nearest object within
-``match_distance_m`` (else it opens one); an object keeps its most readable views (``view_bank``) and its verdict. A check
-resolves the point to the nearest object within twice that distance. An object that already has a verdict answers from
-memory; an undecided one is judged on its most readable view by the Verifier server (selector ``jev_sam3``): correct ->
-ACCEPT, wrong -> REJECT, insufficient -> an approach (GOTO: the planner's own navigation drives toward the object, CONTROL:
-``act`` drives with LiveApproach, nav.gate.approach, until it commits), budget permitting, else REJECT. A point without an
-object is DEFERRED (a ``final`` check rejects it). A check on an object under approach is the planner reporting back:
-CONTROL once the object is close and in view (``approach_ready``) or the planner's navigation ``stalled``, else GOTO again.
+``match_distance_m`` (else it opens one; an object's centroid is the mean of its detections). The views are kept in one
+``EvidenceStore`` (per 0.75 m cell), each with a snapshot of the objects' centroids at its step; an object keeps its verdict
+state, the views it used, its checks and its view bank. A check resolves the point to the nearest object within twice
+``match_distance_m`` and judges the most readable view of it (preferring views that are new since its last check) with the
+Verifier server (selector ``jev_sam3``); a view already judged reuses its verdict. correct -> ACCEPT, wrong -> REJECT,
+insufficient -> an approach (GOTO: the planner's own navigation drives toward the object, CONTROL: ``act`` drives with
+LiveApproach, nav.gate.approach, until it commits), budget permitting, else REJECT. A point without an object is DEFERRED
+(a ``final`` check rejects it). A check on an object under approach is the planner reporting back (``reporting``): CONTROL
+once the object is close and in view or the planner's navigation ``stalled``, else GOTO again; ``approach_ready`` says when
+a new view of the approached object makes a report worthwhile.
+
+Re-check: a rejected (or deferred) object is reset to unverified when ``recheck_cooldown_steps`` have passed since its last
+check, it has fewer than ``max_checks`` checks, and a view of it is new (its camera ``recheck_min_distance_m`` from every
+view used before, or seen from a direction ``recheck_min_angle_deg`` apart). ``observe`` returns those objects (id and world
+point): a planner that keeps its own blacklist of rejected targets forgets them; one without ignores the return value.
 
 Server errors raise. Logs: ``<log_dir>/decisions.jsonl`` (one line per decision; ``meta`` of the check is echoed as
 ``cluster``) and, with ``save_images``, ``<log_dir>/epi<run>_<label>/obj<id>_s<step>/{input.jpg, mask.png, view.png,
@@ -35,7 +43,7 @@ import cv2
 import numpy as np
 
 from nav.gate import client
-from nav.gate.evidence import MATCH_DISTANCE_M, mask_touches_border, view_quality
+from nav.gate.evidence import MATCH_DISTANCE_M, EvidenceStore, mask_touches_border, view_quality
 from nav.gate.ground_truth import semantic_goal_overlap, slugify_label
 
 DEFAULTS = {
@@ -43,11 +51,19 @@ DEFAULTS = {
     "timeout_s": 120.0,
     "ping_timeout_s": 60.0,          # long enough to wait out one in-flight verification
     "match_distance_m": MATCH_DISTANCE_M,   # detection -> object, and a check's point -> object (twice)
-    "view_bank": 24,                 # views kept per object (the most readable plus the newest)
-    "max_views": 256,                # views kept in total
+    "evidence_per_cell": 8,          # views kept per 0.75 m cell (the most readable plus the newest) ...
+    "max_evidence": 256,             # ... and in total
+    "view_bank": 24,                 # views of an object under approach kept for the local planner
+    "sibling_m": 0.5,                # a nearer object this close to the approached one is a fragment of it (bank)
+    "max_checks": 3,
+    "recheck_cooldown_steps": 25,
+    "recheck_min_distance_m": 1.0,
+    "recheck_min_angle_deg": 45.0,
     "approach_max_per_object": 2,
     "approach_max_steps": 40,        # actions per approach
     "approach_episode_steps": 120,   # approach actions per episode
+    "approach_min_closer_m": 0.5,    # a new view of an approached object: this much closer than every judged view ...
+    "approach_min_angle_deg": 30.0,  # ... or this far around the object from each
     "save_images": True,
     "ground_truth_semantic_overlap": 0.5,
 }
@@ -83,6 +99,14 @@ def _distance(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _bearing(camera, point):
+    return math.atan2(point[1] - camera[1], point[0] - camera[0])
+
+
+def _angle_between(a, b):
+    return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+
+
 class ZSONStep:
     """``camera``: {hfov, width, height} of the planner's depth / RGB sensor (logged with every decision)."""
 
@@ -114,19 +138,24 @@ class ZSONStep:
                         "label": str(label), "target": target_name(label),
                         "goal_object_ids": [str(i) for i in goal_object_ids if i is not None]}
         self.objects, self.events, self.last = [], [], None
+        self.evidence = EvidenceStore(self.cfg["match_distance_m"], self.cfg["evidence_per_cell"],
+                                      self.cfg["max_evidence"])
+        self.verdicts = {}         # (step, index) of a judged view -> the server's verdict
         self.decided = []          # (points, verdict) of the objects an approach decided (sim frame): same-object identity
+        self.ready = []            # objects under approach with a new view (approach_ready)
         self.control = self.live = None
         self.approach_steps_used = 0
         self.counts = {key: 0 for key in (
-            "requests", "accepted", "rejected", "deferred", "no_evidence", "same_object", "insufficient", "moves",
-            "approach_early", "approach_stalled", "approach_accepted", "approach_rejected", "approach_undecided",
-            "approach_exhausted", "approach_steps", "sam3_decisions", "jev_decisions")}
+            "requests", "accepted", "rejected", "deferred", "no_evidence", "cached", "reopened", "same_object",
+            "insufficient", "moves", "approach_early", "approach_arrived", "approach_failed", "approach_accepted",
+            "approach_rejected", "approach_undecided", "approach_exhausted", "approach_steps", "sam3_decisions",
+            "jev_decisions")}
 
     def finish_episode(self):
         return dict(self.counts)
 
     def pop_events(self):
-        """Decisions since the last call, for the planner's step record."""
+        """Decisions and reopens since the last call, for the planner's step record."""
         events, self.events = self.events, []
         return events or None
 
@@ -150,9 +179,10 @@ class ZSONStep:
 
     def observe(self, step, rgb, depth, pose, masks, scores, camera_pitch, semantic_instances=None):
         """Store this step's target-class detections. ``pose`` (x, y, yaw) in the planner's world frame, ``depth`` in
-        metres (H x W), ``masks`` / ``scores`` / ``semantic_instances`` one entry per detection."""
+        metres (H x W), ``masks`` / ``scores`` / ``semantic_instances`` one entry per detection. Returns the objects the
+        re-check rule reset to unverified: [{"object": id, "point": (x, y)}] (none while CONTROL drives)."""
         depth = np.asarray(depth, np.float32)
-        centroids = []
+        centroids, new = [], []
         for index, raw in enumerate(masks):
             mask = (np.asarray(raw).squeeze() > 0).astype(np.uint8)
             area = int(mask.sum())
@@ -161,43 +191,97 @@ class ZSONStep:
             if centroid is None:
                 continue
             score = float(scores[index])
-            self._add({"step": int(step), "index": index, "rgb": rgb, "mask": mask, "score": score,
-                       "area_fraction": area / float(mask.size),
-                       "quality": view_quality(score, area / float(mask.size), mask_touches_border(mask)),
-                       "centroid": centroid, "camera": (float(pose[0]), float(pose[1])), "pitch": float(camera_pitch),
-                       "semantic_instances": None if semantic_instances is None else semantic_instances[index]})
+            self._associate(centroid)
+            new.append({"step": int(step), "index": index, "rgb": rgb, "mask": mask, "score": score,
+                        "area_fraction": area / float(mask.size),
+                        "quality": view_quality(score, area / float(mask.size), mask_touches_border(mask)),
+                        "centroid": centroid, "camera": (float(pose[0]), float(pose[1])), "pitch": float(camera_pitch),
+                        "semantic_instances": None if semantic_instances is None else semantic_instances[index]})
+        snapshot = {o["id"]: o["centroid"] for o in self.objects}   # the objects as they stand at this step
+        for view in new:
+            view["objects"] = snapshot
+            self.evidence.add(view)
+        self._bank_views(new)
         self.last = {"depth": depth, "masks": list(masks), "centroids": centroids, "pose": pose}
+        if self.control is not None:   # CONTROL drives: evidence only, no reopens and no approach views
+            return []
+        self._approach_views(step, new)
+        return self._reopen(step, new, snapshot)
 
-    def _add(self, view):
-        near = [o for o in self.objects if _distance(o["centroid"], view["centroid"]) <= self.cfg["match_distance_m"]]
-        if near:
-            obj = min(near, key=lambda o: _distance(o["centroid"], view["centroid"]))
-            n = obj["n"]
-            obj["centroid"] = tuple((a * n + b) / (n + 1) for a, b in zip(obj["centroid"], view["centroid"]))
-            obj["n"] = n + 1
-        else:
-            obj = {"id": len(self.objects), "centroid": view["centroid"], "n": 1, "views": [], "verdict": None,
-                   "approaches": 0, "pending": None}
-            self.objects.append(obj)
-        obj["views"].append(view)
-        if len(obj["views"]) > int(self.cfg["view_bank"]):
-            self._drop_worst(obj["views"])
-        while sum(len(o["views"]) for o in self.objects) > int(self.cfg["max_views"]):
-            crowded = max(self.objects, key=lambda o: len(o["views"]))
-            if len(crowded["views"]) < 2:
-                break
-            self._drop_worst(crowded["views"])
-
-    @staticmethod
-    def _drop_worst(views):
-        """Drop the least readable view, never the newest."""
-        newest = max(views, key=lambda v: (v["step"], v["index"]))
-        views.remove(min((v for v in views if v is not newest), key=lambda v: (v["quality"], v["step"])))
+    def _associate(self, centroid):
+        near = [o for o in self.objects if _distance(o["centroid"], centroid) <= self.cfg["match_distance_m"]]
+        if not near:
+            self.objects.append({"id": len(self.objects), "centroid": centroid, "n": 1, "state": None, "checks": 0,
+                                 "last_step": 0, "point": centroid, "used": [], "approaches": 0, "pending": None,
+                                 "bank": []})
+            return
+        obj = min(near, key=lambda o: _distance(o["centroid"], centroid))
+        obj["centroid"] = tuple((a * obj["n"] + b) / (obj["n"] + 1) for a, b in zip(obj["centroid"], centroid))
+        obj["n"] += 1
 
     def _object_at(self, point):
         """The nearest object within twice ``match_distance_m`` of ``point``, else None."""
         near = [o for o in self.objects if _distance(o["centroid"], point) <= 2 * self.cfg["match_distance_m"]]
         return min(near, key=lambda o: _distance(o["centroid"], point)) if near else None
+
+    def _novel(self, view, used):
+        """True when ``view`` sees its object from far enough, or a different enough direction, compared with every
+        view used before."""
+        bearing = _bearing(view["camera"], view["centroid"])
+        return all(_distance(view["camera"], u["camera"]) >= self.cfg["recheck_min_distance_m"]
+                   or math.degrees(_angle_between(bearing, u["bearing"])) >= self.cfg["recheck_min_angle_deg"]
+                   for u in used)
+
+    @staticmethod
+    def _reference(view, obj, centroid, by_position=False):
+        """Where ``view`` should be for ``obj``: the object's centroid at the view's step (objects grow), else
+        ``centroid``. A stop (``by_position``) uses ``centroid``, the point."""
+        return centroid if by_position else view["objects"].get(obj["id"], centroid)
+
+    @staticmethod
+    def _closer_to_other(view, obj, distance):
+        """True when another object (as of the view's step) is nearer the view than ``distance``."""
+        return any(other != obj["id"] and _distance(view["centroid"], c) < distance
+                   for other, c in view["objects"].items())
+
+    def _reopen(self, step, new, snapshot):
+        reopened = []
+        for obj in self.objects:
+            if (obj["state"] not in (REJECT, DEFER) or obj["checks"] >= self.cfg["max_checks"]
+                    or step - obj["last_step"] < self.cfg["recheck_cooldown_steps"]):
+                continue
+            centroid = snapshot.get(obj["id"], obj["point"])
+            if any(_distance(v["centroid"], self._reference(v, obj, centroid)) <= self.cfg["match_distance_m"]
+                   and self._novel(v, obj["used"]) for v in new):
+                obj["state"] = None
+                reopened.append({"object": obj["id"], "point": centroid})
+                self.counts["reopened"] += 1
+                self.events.append({"event": "reopen", "object": obj["id"], "step": int(step)})
+                print(f"[verification] object {obj['id']} reopened at step {step} (new view)")
+        return reopened
+
+    def _select(self, obj, point, by_position):
+        """(view, match distance) for ``obj``: the most readable view within ``match_distance_m`` of it (ties: nearest),
+        else the nearest within twice that, else (None, None). Views nearer another object do not count. A re-check
+        prefers views that are new by the re-check rule."""
+        pool = list(self.evidence)
+        if obj["used"]:
+            pool = [v for v in pool if self._novel(v, obj["used"])] or pool
+
+        def distance(view):
+            return _distance(view["centroid"], self._reference(view, obj, point, by_position))
+
+        if not by_position:
+            pool = [v for v in pool if not self._closer_to_other(v, obj, distance(v))]
+        matched = [v for v in pool if distance(v) <= self.cfg["match_distance_m"]]
+        if matched:
+            best = max(matched, key=lambda v: (v["quality"], -distance(v)))
+            return best, distance(best)
+        near = [v for v in pool if distance(v) <= 2 * self.cfg["match_distance_m"]]
+        if near:
+            best = min(near, key=distance)
+            return best, distance(best)
+        return None, None
 
     def _same_as_decided(self, point):
         """The identity rule of the approach (approach.associate) against the objects an approach decided: each one's
@@ -229,8 +313,8 @@ class ZSONStep:
     def check(self, step, point, final=False, reporting=False, stalled=False, meta=None):
         """The planner believes the target is at ``point`` (world x, y). ``final``: it is about to stop here (no approach
         possible: insufficient rejects, a deferral rejects). ``reporting``: ``point`` is the GOTO point the step gave it,
-        and the planner reports back (a new view of it, or ``stalled``: its own navigation ended, arrived / no path /
-        budget, so CONTROL takes over wherever it stands). ``meta``: the request, echoed in the log."""
+        and the planner reports back: a new view of it (``approach_ready``), or ``stalled`` ("arrived", or "failed": no
+        path, budget), so CONTROL takes over wherever it stands. ``meta``: the request, echoed in the log."""
         point = (float(point[0]), float(point[1]))
         if reporting:
             pending = [o for o in self.objects if o["pending"] is not None
@@ -239,56 +323,65 @@ class ZSONStep:
                 raise RuntimeError(f"check(reporting=True) at {point}: no approach is pending there")
             return self._continue_approach(step, pending[0], stalled)
         obj = self._object_at(point)
-        if obj is not None and obj["pending"] is not None:   # a fresh trigger: the planner dropped the approach
-            print(f"[verification] object {obj['id']}: stale approach {obj['pending']['id']} dropped")
-            obj["pending"] = None
         record = {**{k: self.episode[k] for k in ("run_index", "scene", "episode_id", "label", "target")},
                   "step": int(step), "cluster": meta, "object": None if obj is None else obj["id"],
                   "point": list(point), "final": bool(final), "server": self.server.get("settings"),
                   "camera": self.camera, "evidence": None, "verdict": None, "latency_s": None, "error": None,
                   "policy": None, "source": "server", "ground_truth": None, "status": None, "model": None}
         self.counts["requests"] += 1
-        if obj is not None and obj["verdict"] is not None:
-            record.update(policy="remembered", source="memory")
-            return self._decide(record, obj, obj["verdict"])
+        if obj is not None:
+            obj["checks"] += 1
+            obj["last_step"], obj["point"] = int(step), point
+            if obj["pending"] is not None:   # a fresh trigger: the planner dropped the approach
+                print(f"[verification] object {obj['id']}: stale approach {obj['pending']['id']} dropped")
+                obj["pending"] = None
         same = self._same_as_decided(point)
         if same is not None:
             self.counts["same_object"] += 1
             record.update(policy="same_as_" + ("accepted" if same[0] == ACCEPT else "rejected"),
                           same_iou=round(float(same[1]), 3))
             return self._decide(record, obj, same[0])
-        if obj is None:
+        view, match = (None, None) if obj is None else self._select(obj, point, final)
+        if view is None:
             self.counts["no_evidence"] += 1
             record["policy"] = "on_no_evidence=defer"
             return self._decide(record, obj, REJECT if final else DEFER)
-        return self._judge(record, obj, step, final)
+        return self._judge(record, obj, view, match, step, final)
 
-    def _judge(self, record, obj, step, final):
-        view = max(obj["views"], key=lambda v: (v["quality"], -_distance(v["centroid"], obj["centroid"])))
+    def _judge(self, record, obj, view, match, step, final):
         elevation = -math.degrees(view["pitch"])  # Habitat pitch is negative looking down
         record["evidence"] = {"step": view["step"], "index": view["index"], "score": view["score"],
-                              "area_fraction": round(view["area_fraction"], 5),
-                              "match_distance_m": round(_distance(view["centroid"], record["point"]), 3),
+                              "area_fraction": round(view["area_fraction"], 5), "match_distance_m": round(match, 3),
                               "camera": list(view["camera"]), "centroid": list(view["centroid"]),
                               "pitch": view["pitch"], "input_elevation": elevation}
         record["ground_truth"] = semantic_goal_overlap(view["semantic_instances"], self.episode["goal_object_ids"],
                                                        self.cfg["ground_truth_semantic_overlap"])
-        start = time.time()
-        try:
-            reply = self._verify(self.cfg["url"], view["rgb"], view["mask"], self.episode["target"],
-                                 input_elevation=elevation,
-                                 request_id=f"epi{self.episode['run_index']}_o{obj['id']}_s{step}",
-                                 timeout=float(self.cfg["timeout_s"]))
-        except Exception as error:   # no fallbacks: a run never goes on silently unverified
-            record.update(error=f"{type(error).__name__}: {error}", latency_s=round(time.time() - start, 3))
-            self._log(record, view, None)
-            raise
-        verdict = reply["verdict"]
+        obj["used"].append({"camera": view["camera"], "bearing": _bearing(view["camera"], view["centroid"]),
+                            "range": _distance(view["camera"], view["centroid"])})
+        key = (view["step"], view["index"])
+        reply = None
+        if key in self.verdicts:   # this exact view was already judged
+            self.counts["cached"] += 1
+            record.update(source="cached", verdict=self.verdicts[key])
+        else:
+            start = time.time()
+            try:
+                reply = self._verify(self.cfg["url"], view["rgb"], view["mask"], self.episode["target"],
+                                     input_elevation=elevation,
+                                     request_id=f"epi{self.episode['run_index']}_o{obj['id']}_s{step}",
+                                     timeout=float(self.cfg["timeout_s"]))
+            except Exception as error:   # no fallbacks: a run never goes on silently unverified
+                record.update(error=f"{type(error).__name__}: {error}", latency_s=round(time.time() - start, 3))
+                self._log(record, view, None)
+                raise
+            self.verdicts[key] = reply["verdict"]
+            record.update(verdict=reply["verdict"], latency_s=round(time.time() - start, 3))
+        verdict = record["verdict"]
         status = verdict.get("status")
         if status not in TRI_STATES:
             raise RuntimeError(f"verdict without a three-way status: {status!r}")
         model = verdict.get("source")
-        record.update(verdict=verdict, latency_s=round(time.time() - start, 3), status=status, model=model)
+        record.update(status=status, model=model)
         if model in ("sam3", "jev"):
             self.counts[f"{model}_decisions"] += 1
         if status != "insufficient":
@@ -301,11 +394,15 @@ class ZSONStep:
             return self._decide(record, obj, REJECT, view, reply)
         obj["approaches"] += 1
         self.counts["moves"] += 1
-        obj["pending"] = {"id": obj["approaches"], "issued_step": int(step), "object": tuple(view["centroid"]),
-                          "camera": tuple(view["camera"]), "max_steps": self._steps_allowed(step), "native": 0,
-                          "meta": record["cluster"]}
-        record["approach"] = {"id": obj["pending"]["id"], "issued": True, "object": list(obj["pending"]["object"]),
-                              "camera": list(obj["pending"]["camera"]), "max_steps": obj["pending"]["max_steps"]}
+        pending = obj["pending"] = {"id": obj["approaches"], "issued_step": int(step), "object": tuple(view["centroid"]),
+                                    "camera": tuple(view["camera"]), "max_steps": self._steps_allowed(step),
+                                    "native": 0, "early": None, "meta": record["cluster"]}
+        obj["bank"] = []   # seeded with every stored view of the object
+        for item in sorted(self.evidence, key=lambda v: v["step"]):
+            if self._bank_match(item, obj, pending) is not None:
+                self._bank_add(obj, item)
+        record["approach"] = {"id": pending["id"], "issued": True, "object": list(pending["object"]),
+                              "camera": list(pending["camera"]), "max_steps": pending["max_steps"]}
         verdict = self._approach_verdict(obj)
         return self._decide(record, obj, verdict.kind, view, reply, verdict)
 
@@ -333,6 +430,80 @@ class ZSONStep:
     # Approach
     # ------------------------------------------------------------------
 
+    def _bank_match(self, view, obj, pending):
+        """Match distance when ``view`` is a view of the approached object for the bank, else None: within
+        ``match_distance_m`` of the issued object point or the object's centroid at the view's step, and no other
+        object nearer it, unless that object lies within ``sibling_m`` of this one (a fragment of it)."""
+        reference = view["objects"].get(obj["id"])
+        distance = _distance(view["centroid"], pending["object"])
+        if reference is not None:
+            distance = min(distance, _distance(view["centroid"], reference))
+        if distance > self.cfg["match_distance_m"]:
+            return None
+        reference = pending["object"] if reference is None else reference
+        if any(other != obj["id"] and _distance(view["centroid"], c) < distance
+               and _distance(c, reference) > self.cfg["sibling_m"] for other, c in view["objects"].items()):
+            return None
+        return distance
+
+    def _bank_add(self, obj, view):
+        """Add ``view`` to the object's bank once; past ``view_bank`` views drop the least readable one, never the newest."""
+        bank = obj["bank"]
+        if any((b["step"], b["index"]) == (view["step"], view["index"]) for b in bank):
+            return
+        bank.append(view)
+        while len(bank) > int(self.cfg["view_bank"]):
+            newest = max(bank, key=lambda b: (b["step"], b["index"]))
+            bank.remove(min((b for b in bank if b is not newest), key=lambda b: (b["quality"], b["step"])))
+
+    def _bank_views(self, new):
+        """Bank this step's views of every object under approach."""
+        for obj in self.objects:
+            pending = obj["pending"]
+            if pending is None:
+                continue
+            for view in new:
+                if view["step"] >= pending["issued_step"] and self._bank_match(view, obj, pending) is not None:
+                    self._bank_add(obj, view)
+
+    def _approach_view(self, view, obj, pending):
+        """Match distance when ``view`` is a new view of the approached object: taken since the approach was issued, of
+        the object point (not nearer another object), and closer by ``approach_min_closer_m`` than, or
+        ``approach_min_angle_deg`` around the object from, every view judged for the object. Else None."""
+        if view["step"] < pending["issued_step"]:
+            return None
+        # The issued object point, or the object's centroid at the view's step (a large object's centroid drifts)
+        distance = _distance(view["centroid"], pending["object"])
+        if obj["id"] in view["objects"]:
+            distance = min(distance, _distance(view["centroid"], view["objects"][obj["id"]]))
+        if distance > self.cfg["match_distance_m"] or self._closer_to_other(view, obj, distance):
+            return None
+        rng = _distance(view["camera"], view["centroid"])
+        bearing = _bearing(view["camera"], view["centroid"])
+        closer, angle = float(self.cfg["approach_min_closer_m"]), math.radians(self.cfg["approach_min_angle_deg"])
+        if all(rng <= u.get("range", _distance(u["camera"], pending["object"])) - closer
+               or _angle_between(bearing, u["bearing"]) >= angle for u in obj["used"]):
+            return distance
+        return None
+
+    def _approach_views(self, step, new):
+        """Objects under approach with a new view this step (once until it is reported): ``approach_ready``."""
+        for obj in self.objects:
+            pending = obj["pending"]
+            if pending is None or pending["early"] is not None:
+                continue
+            views = [(v, d) for v in new for d in [self._approach_view(v, obj, pending)] if d is not None]
+            if views:
+                pending["early"] = max(views, key=lambda v: (v[0]["quality"], -v[1]))
+                self.ready.append(obj["id"])
+                print(f"[verification] object {obj['id']}: new view at step {step} during approach {pending['id']}")
+
+    def approach_ready(self):
+        """Ids of the objects under approach (GOTO) with a new view since the last call: the planner should report back
+        (``check(..., reporting=True)``)."""
+        ready, self.ready = self.ready, []
+        return ready
+
     def _close(self, pending):
         """True when CONTROL can take ``pending`` from the last observed frame (see HANDOFF_*). Farther or out of view,
         the planner's own navigation approaches first: the local planner only knows what it has seen since it took over."""
@@ -347,28 +518,26 @@ class ZSONStep:
                    and int((np.asarray(m).squeeze() > 0).sum()) >= HANDOFF_PX
                    for m, c in zip(self.last["masks"], self.last["centroids"]))
 
-    def approach_ready(self):
-        """True when an object under approach (GOTO) is now close and in view: the planner should check again."""
-        return any(o["pending"] is not None and self._close(o["pending"]) for o in self.objects)
-
     def _approach_verdict(self, obj, kind=None):
         """GOTO while the planner's own navigation approaches, CONTROL when the local planner can take over."""
         pending = obj["pending"]
         kind = kind or (CONTROL if self._close(pending) else GOTO)
         if kind == CONTROL:
-            self.control = obj
+            self.control, self.ready = obj, []
         return Verdict(kind, obj["id"], pending["object"], pending["camera"], pending["max_steps"], pending["id"])
 
     def _continue_approach(self, step, obj, stalled):
         pending = obj["pending"]
         if not stalled and not self._close(pending):
+            pending["early"] = None   # the next new view reports again
             return self._approach_verdict(obj, GOTO)
         pending["native"] = int(step) - pending["issued_step"]   # the planner's own approach actions
         self.approach_steps_used += pending["native"]
         self.counts["approach_steps"] += pending["native"]
-        self.counts["approach_stalled" if stalled else "approach_early"] += 1
+        self.counts["approach_early" if not stalled else "approach_arrived" if stalled == "arrived"
+                    else "approach_failed"] += 1
         print(f"[verification] object {obj['id']}: planner approach {pending['id']} "
-              f"{'stalled' if stalled else 'close'} after {pending['native']} steps -> {PLANNER}")
+              f"{stalled or 'close'} after {pending['native']} steps -> {PLANNER}")
         return self._approach_verdict(obj, CONTROL)
 
     def act(self, step, rgb, depth, pose, masks):
@@ -386,7 +555,7 @@ class ZSONStep:
                 self.sim, self.cfg["url"], self.episode["target"], pending["object"],
                 min(max(pending["max_steps"] - pending["native"], MIN_PLANNER_STEPS),
                     self.max_episode_steps - 1 - int(step)),
-                PLANNER, log_dir=os.path.join(self.log_dir, "approach", tag), tag=tag, bank=self.control["views"])
+                PLANNER, log_dir=os.path.join(self.log_dir, "approach", tag), tag=tag, bank=self.control["bank"])
         depth = np.asarray(depth, np.float32)
         centroids = [self._centroid(depth, (np.asarray(m).squeeze() > 0).astype(np.uint8), pose) for m in masks]
         name = self.live.step(rgb, depth, masks, centroids, pose)
@@ -422,7 +591,7 @@ class ZSONStep:
                                "steps": steps, "views": result.get("views"), "counted": result.get("counted"),
                                "object": list(pending["object"]), "issued_step": pending["issued_step"],
                                "log": live.log_dir, "episode_steps_used": self.approach_steps_used}}
-        obj["pending"], self.control, self.live = None, None, None
+        obj["pending"], obj["last_step"], self.control, self.live = None, int(step), None, None
         live.close()
         print(f"[verification] approach ({PLANNER}) object {obj['id']}: {result['status']} by {result['by']} "
               f"after {steps} actions")
@@ -433,8 +602,8 @@ class ZSONStep:
     # ------------------------------------------------------------------
 
     def _decide(self, record, obj, kind, view=None, reply=None, verdict=None):
-        if obj is not None and kind in (ACCEPT, REJECT):
-            obj["verdict"] = kind
+        if obj is not None:
+            obj["state"] = kind
         record["state"] = STATES[kind]
         if kind in COUNT:   # an approach is counted as a move when issued
             self.counts[COUNT[kind]] += 1
