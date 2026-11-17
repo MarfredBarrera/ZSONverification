@@ -1,13 +1,13 @@
-"""Verification evidence: detections stored per place, ranked by readability.
+"""Verification evidence: target detections stored per place, ranked by readability.
 
 ``view_quality``, ``mask_touches_border`` and ``MATCH_DISTANCE_M`` mirror
 basic_utils/record_episode/episode_visualization.py (``_view_quality``,
-``_mask_touches_border``, ``COMMIT_MATCH_DISTANCE_M``), so the online step and
+``_mask_touches_border``, ``COMMIT_MATCH_DISTANCE_M``), so the online gate and
 the offline commit review rank views the same way.
 """
 import math
 
-# How far a detection may sit from an object's centroid and still count as a
+# How far a detection may sit from a cluster's centroid and still count as a
 # view of it.
 MATCH_DISTANCE_M = 0.75
 # A mask covering this fraction of the frame already shows the object well

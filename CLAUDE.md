@@ -56,17 +56,18 @@ reusable plots, and all images, angles, and scores stored in the study database.
   env); `python -m perception` verifies one frame. `scripts/apexnav_fp.py`
   evaluates it on ApexNav's false-positive episodes. `python -m perception.server`
   serves one `Verifier` over HTTP (port 8772 for the ObjectNav runs, `--selector jev_sam3`).
-- `nav/` is the planner-agnostic **ZSON verification step** (no ROS, no planner imports): `nav/gate/step.py`
-  (`ZSONStep`: own SAM3 detection + object memory from RGB + depth + pose, verdicts ACCEPT / REJECT / DEFER / GOTO /
-  CONTROL, `LiveApproach` for CONTROL), `nav/approach` (MPPI approach planner, decision flow), `nav/lastmile` (optional,
-  separate: split navigator, medial planner, episode collision map), `nav/eval` (run-format scoring). `nav/README.md` is the
-  interface, the ApexNav adapter mapping and the VLFM adapter checklist. Tests live next to the code:
-  `python -m unittest discover -s nav -t .` (core env, `PYTHONPATH=/workspace`; `test_mppi_v15` takes ~1 min).
-- `planners/ApexNav` (git submodule, branch `main`) is a thin adapter: `habitat_evaluation.py` maps the planner's detections,
-  cluster requests and approach states to `ZSONStep` calls (split last-mile on by default, `NAV_SPLIT=false` = ablation), plus
-  ROS messages, run scripts (`scripts/run_pool.sh` arms `zson`, `zson_nosplit`, `baseline` = raw ApexNav; `run_worker.sh`,
-  `stop_run.sh`, `zson.env` for the Verifier host and port), docker. Its compose file mounts this repo at
-  `/workspace/ZSONverification` (on `PYTHONPATH`). Run outputs go to `planners/ApexNav/videos/<run>` (not tracked).
+- `nav/` is the planner-agnostic navigation side (no ROS, no planner imports): `nav/gate`
+  (client, evidence, `VerificationGate`, closed-loop `LiveApproach`), `nav/approach`
+  (MPPI approach planner, decision flow), `nav/lastmile` (split navigator, medial
+  planner, episode collision map), `nav/eval` (run-format scoring: `closer_attrib`,
+  `nav_table`). `nav/README.md` is the API a planner adapter calls. Tests live next to
+  the code: `python -m unittest discover -s nav -t .` (core env, `PYTHONPATH=/workspace`;
+  `test_mppi_v15` takes ~1 min).
+- `planners/ApexNav` (git submodule, branch `main`) holds only ApexNav-specific glue:
+  `habitat_evaluation.py` hooks, ROS messages, run scripts (`scripts/run_pool.sh`,
+  `run_worker.sh`, `stop_run.sh`, `zson.env` for the Verifier host and port), docker.
+  Its compose file mounts this repo at `/workspace/ZSONverification` (on `PYTHONPATH`).
+  Run outputs go to `planners/ApexNav/videos/<run>` (not tracked).
   `planners/VLFM` (fork MarfredBarrera/vlfm, remote `upstream` = rai-opensource/vlfm; no hooks yet) goes the same way.
 - `python -m study --config configs/<name>.yaml` runs render -> reconstruct ->
   score -> pick -> detect -> analyze. Stages resume. Outputs are in `outputs/<study>/`,

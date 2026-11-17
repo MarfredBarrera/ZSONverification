@@ -49,15 +49,3 @@ def semantic_goal_overlap(instances, goal_object_ids, min_overlap=0.5):
         "match_threshold": float(min_overlap),
         "is_correct_instance": bool(goal_ids) and overlap >= min_overlap,
     }
-
-
-def semantic_instances(semantic, mask):
-    """Ground-truth logging only: the scene-instance ids under ``mask`` in a semantic image, [{id, pixels}] largest first
-    (the structure ``semantic_goal_overlap`` reads), or None without a semantic image."""
-    import numpy as np
-    if semantic is None:
-        return None
-    ids, counts = np.unique(np.asarray(semantic).squeeze()[np.asarray(mask).squeeze() > 0], return_counts=True)
-    keep = ids > 0
-    order = np.argsort(-counts[keep])
-    return [{"id": str(int(i)), "pixels": int(n)} for i, n in zip(ids[keep][order], counts[keep][order])]

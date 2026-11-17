@@ -280,9 +280,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(status, reply)
 
     def _detect(self):
-        """POST /detect {image, target, words?, min_score?}: SAM3 as the approach detector. Instances of the target and
-        its approach look-alikes (jev.APPROACH_LOOKALIKES), or of the target and ``words`` when given, scoring >=
-        min_score (0.3), each {word, score, box, mask
+        """POST /detect {image, target, min_score?}: SAM3 as the approach detector. Instances of the target and its
+        approach look-alikes (jev.APPROACH_LOOKALIKES) scoring >= min_score (0.3), each {word, score, box, mask
         (PNG, base64), scores (SAM3 score of every vocabulary word on that segment)}: {ok, candidates}."""
         start, record = time.time(), {"request_id": None, "path": "/detect"}
         try:
@@ -292,7 +291,7 @@ class _Handler(BaseHTTPRequestHandler):
             record.update(request_id=raw.get("request_id"), target=target)
             verifier = self.server.verifier
             vocabulary = select.competitors(verifier.vocabulary, target)
-            words = [target] + [w for w in raw.get("words", APPROACH_LOOKALIKES.get(target, [])) if w in vocabulary]
+            words = [target] + [w for w in APPROACH_LOOKALIKES.get(target, []) if w in vocabulary]
             found = verifier.candidates(decode(raw["image"]), words, vocabulary, float(raw.get("min_score", 0.3)))
         except (KeyError, ValueError) as error:
             status, reply = 400, {"ok": False, "error": str(error)}

@@ -64,13 +64,27 @@ def verify(url, rgb, mask, target, input_elevation=0.0, vocabulary=None, request
     return reply
 
 
-def detect(url, rgb, target, words, min_score, request_id=None, timeout=120.0):
-    """POST /detect: the SAM3 instances of ``target`` and ``words`` in a frame scoring >= ``min_score``.
-    -> [(word, score, mask HxW uint8 0/1)], best first per word. Raises on transport or server errors."""
-    payload = {"protocol": PROTOCOL, "request_id": request_id, "target": target, "words": list(words),
-               "min_score": float(min_score), "image": encode_png(cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR))}
-    reply = _call(url, "/detect", payload, timeout=timeout)
+def verify_views(url, views, target, sam3="fallback", vocabulary=None, request_id=None, timeout=120.0,
+                 **variants):
+    """POST /verify_views (server selector d1 or jev): one decision over several views of one object,
+    nearest first. ``views``: [{rgb, mask, input_elevation, step, index, range_m, scores?, jev?}] (rgb
+    HxWx3 RGB, mask HxW nonzero on the object; ``scores``: SAM3 scores and ``jev``: raw JEV
+    probabilities the server returned for that view before, so it is judged only once). ``variants``: grid, grid_view, crop_small, forced2, forced2_min,
+    sam3_shortcut, grid_scores, forced (jev, jev_sam3). Returns {ok, verdict, grid_image}; raises on transport or
+    server errors."""
+    payload = {"protocol": PROTOCOL, "request_id": request_id, "target": target, "sam3": sam3,
+               "vocabulary": vocabulary, **variants, "views": []}
+    for view in views:
+        entry = {"image": encode_png(cv2.cvtColor(np.ascontiguousarray(view["rgb"]), cv2.COLOR_RGB2BGR)),
+                 "mask": encode_png(((np.asarray(view["mask"]) > 0) * 255).astype(np.uint8)),
+                 "input_elevation": float(view.get("input_elevation", 0.0)), "step": int(view["step"]),
+                 "index": int(view["index"]), "range_m": float(view["range_m"])}
+        if view.get("scores") is not None:
+            entry["scores"] = view["scores"]
+        if view.get("jev") is not None:
+            entry["jev"] = view["jev"]
+        payload["views"].append(entry)
+    reply = _call(url, "/verify_views", payload, timeout=timeout)
     if not reply.get("ok"):
-        raise RuntimeError(f"perception server /detect: {reply.get('error')}")
-    return [(c["word"], float(c["score"]), (cv2.cvtColor(decode_png(c["mask"]), cv2.COLOR_RGB2GRAY) > 127).astype(np.uint8))
-            for c in reply["candidates"]]
+        raise RuntimeError(f"perception server: {reply.get('error')}")
+    return reply
