@@ -3,17 +3,16 @@ planner heads for a gate-ACCEPTED object (or, scope "object", for an object the 
 motion actions is replaced by MedialNav's action toward that object (nav.lastmile.medial: A* over the agent's state
 lattice on our own episode collision map). The planner's own STOP, exploration and other actions are untouched.
 
-``SplitNav.act(native_action, target, sim, pose_pf, gate, body_map)`` -> (override action or None, info).
+``SplitNav.act(native_action, target, sim, pose_pf, accepted_points, body_map)`` -> (override action or None, info).
 ``target``: what the planner is heading for, in the planner frame: {"cluster_id", "x", "y" (the target point),
-"accepted" (the gate accepted that object), "heading_to_object" (the planner navigates to an unaccepted object),
+"accepted" (the verification step accepted that object), "heading_to_object" (the planner navigates to an unaccepted object),
 "log" (extra fields for ``info``)}. ``pose_pf``: the agent's (x, y, yaw) in the planner frame at the step the target
-was published. ``body_map``: nav.lastmile.body_map.BodyMap (EpisodeCollisionMap.lmap).
+was published. ``accepted_points``: the points (M, 3, sim frame) of every object the step accepted (``ZSONStep.accepted_points()``). ``body_map``: nav.lastmile.body_map.BodyMap (EpisodeCollisionMap.lmap).
 """
 import math
 
 import numpy as np
 
-from nav.gate import gate as G
 from nav.approach import scene
 from nav.lastmile.medial import MedialNav, STEP_M
 
@@ -86,7 +85,7 @@ class SplitNav:
             self.point, self.point_ident = np.asarray(target_xz, float).copy(), ident
         return ident, self.point[None, :], "point"
 
-    def act(self, native_name, target, sim, pose_pf, gate, body_map):
+    def act(self, native_name, target, sim, pose_pf, accepted_points, body_map):
         sc = scope(target)
         info = {"target_cluster_id": int(target["cluster_id"]), "target_accepted": bool(target["accepted"]),
                 "scope": sc, **target.get("log", {})}
@@ -96,7 +95,7 @@ class SplitNav:
             return None, info
         position, yaw, _ = scene.agent_pose(sim)
         target_xz = pf_to_world_xz((target["x"], target["y"]), position, yaw, pose_pf)
-        accepted = [(i, p) for i, (p, s) in enumerate(gate.decided_objects) if s == G.ACCEPTED] if sc == "accepted" else []
+        accepted = list(enumerate(accepted_points)) if sc == "accepted" else []
         ident, goal_xz, source = self.goal(target_xz, accepted, target["cluster_id"])
         if ident != self.ident or self.nav is None:
             self.ident, self.nav = ident, MedialNav(sim, stop_m=self.stop_m, blocked_m=BLOCKED_M)

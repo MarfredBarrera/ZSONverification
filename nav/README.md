@@ -1,72 +1,116 @@
-# nav: planner-agnostic gate, approach and last-mile navigation
+# nav: the ZSON verification step, planner-agnostic
 
-Everything an ObjectNav planner needs to put the Verifier in its loop, with no ROS and no planner imports. The planner
-keeps its exploration and its own detector; this package decides **whether a candidate detection is the target**
-(accept / reject / defer), drives the **approach** to get a better view when the first one is insufficient, and
-optionally replaces the planner's motion toward an accepted target (**split navigation**). ApexNav is the first
-adapter (`planners/ApexNav`, `habitat_evaluation.py`); a VLFM adapter implements the same calls.
+An ObjectNav planner keeps its exploration, its detector and its navigation. The **ZSON verification step**
+(`nav/gate/step.py`, `ZSONStep`) decides **whether a candidate detection is the target**: it builds its own object memory from
+the planner's target-class masks, depth and pose, keeps the verdicts and evidence on those objects, and when the first view
+is insufficient it gets a clearer one (the approach). No ROS, no planner imports, no dependence on the planner's object
+clusters. ApexNav is the first adapter (`planners/ApexNav`, `habitat_evaluation.py`, a thin one); VLFM is next.
 
 ```
-nav/gate      client.py (HTTP to perception.server), evidence.py, gate.py (VerificationGate), approach.py (LiveApproach),
-              ground_truth.py (logging helpers)
+nav/gate      step.py (ZSONStep, Verdict), approach.py (LiveApproach: closed-loop approach + decision flow), client.py (HTTP to
+              perception.server), evidence.py (view quality), ground_truth.py (logging helpers)
 nav/approach  mppi.py (MppiV15 + closer.py warm start), decide.py (belief + fused SAM3 verdict), size_opinion.py,
               local_nav.py, geom.py, scene.py
-nav/lastmile  split.py (SplitNav), medial.py (A* on the agent's state lattice), collision_map.py, body_map.py
+nav/lastmile  optional, separate: split.py (SplitNav), medial.py, collision_map.py, body_map.py
 nav/eval      closer_attrib.py, nav_table.py (outcome scoring of run directories)
 ```
 
-Requirements: numpy, scipy, cv2, torch (CPU) and, for the gate, the Verifier server (`python -m perception.server --selector
-jev_sam3`, `perception.jev` and `perception.select` are imported by `nav.approach.decide`). Put the repo root on `PYTHONPATH`.
-The agent body is a `habitat_sim.Simulator` (`sim.get_agent(0).get_state()`, sensor `"rgb"`; `nav.approach.scene`
-reads pose and camera from it, numpy-quaternion needed), with ApexNav's embodiment constants (640x480, hfov 79, camera
-0.88 m, radius 0.18, forward 0.25 m, turns 30 deg, no sliding, camera pitch 0 during an approach). Another simulator or
-robot needs its own `scene.agent_pose` / `scene.camera`.
+## What is the step, what is the planner
 
-## What the planner provides
+| the step (ours) | the planner (native) |
+|---|---|
+| object memory: world centroid per detection, association by distance (`match_distance_m` 0.75 m), most readable views per object | exploration, frontier / value maps |
+| verdicts and evidence (Verifier server, `jev_sam3`), identity of an already decided object (`same_as_decided`), budgets | the detector (target-class masks and scores) |
+| the approach: JEV naming belief, fused SAM3, MPPI view planner (`LiveApproach`, `MppiV15`) | choosing the target, its own navigation, STOP |
 
-Frames and poses of the **planner's own** frame: `pose = (x, y, yaw)` in its world (x, y plane), detections as
-target-class masks (`H x W`, nonzero on the object) with their world centroids `(x, y)`, RGB `H x W x 3 uint8`, depth in
-metres `H x W float32` (sensor range 5 m), `label` the target category.
+The step ends at the verdict plus the approach needed to reach it. **Split last-mile navigation** (`nav/lastmile`) is not
+part of it: an adapter may call `SplitNav.act` with `ZSONStep.accepted_points()`; in the ApexNav adapter it is on by default
+and `NAV_SPLIT=false` turns it off (ablation).
+
+Requirements: numpy, scipy, cv2, torch (CPU) and the Verifier server (`python -m perception.server --selector jev_sam3`;
+`perception.jev` and `perception.select` are imported by `nav.approach.decide`). Put the repo root on `PYTHONPATH`. The
+local approach planner reads the agent body from a `habitat_sim.Simulator` (`start_episode(..., sim)`; `nav.approach.scene`
+reads pose and camera from it, numpy-quaternion needed), with ApexNav's embodiment (640x480, hfov 79, camera 0.88 m, radius
+0.18, forward 0.25 m, turns 30 deg, no sliding, camera pitch 0 during an approach). Another simulator or robot needs its
+own `scene.agent_pose` / `scene.camera`; that is the one non-agnostic dependency left.
+
+## Interface (`ZSONStep`)
+
+Frames are in the **planner's** world frame: `pose = (x, y, yaw)`, `point = (x, y)`, depth in metres (`H x W`), masks
+`H x W` (nonzero on the object), RGB `H x W x 3 uint8`.
 
 | Call | When | Inputs | Output |
 |---|---|---|---|
-| `VerificationGate(cfg, log_dir_root, camera={hfov, width, height, position})` | once | `cfg` = the `verification.*` keys (`gate.DEFAULTS`; `enabled`, `url`, `approach`, `on_error=reject`, `multiview*`, `approach_planner=mppi_v15`, `on_no_evidence`) | pings the server; raises on a wrong URL / selector |
-| `gate.start_episode(run_index, scene, episode_id, label, goal_object_ids, max_episode_steps)` | episode start | | |
-| `gate.observe(step, rgb, masks, labels, scores, centroids, semantic_instances, pose, camera_pitch, fusion, external_approach)` | after every executed step | label `0` = target class, `fusion = {"clusters": [{"id", "centroid"}]}` (the planner's object clusters) | ids of rejected clusters to reopen (the planner forgets their verdict) |
-| `gate.handle(request, fusion, step, frame)` | the planner selected a candidate cluster and **waits** | `request`: `seq, cluster_id, centroid_x, centroid_y, confidence, observation_num, expl_result, at_stop`, and for a re-request `approach_id, viewpoint_status, approach_steps`; `frame` from the last step (`depth, masks, centroids, cam`) | `1` accept, `-1` reject, `2` defer (treat as a non-detection, keep exploring), `3` approach |
-| `gate.pending_approach(cluster_id)`, `gate.approach_close(request, last_step)`, `gate.approach_handoff(request, last_step)` | state `3` | | the approach issued; whether the object is close and in view; whether the planner's own navigation keeps approaching (`"native"`) or the gate's planner takes over (`"planner"`) |
-| `LiveApproach(sim, url, target, object_pf, budget, "mppi_v15", log_dir, tag, bank=gate.approach_bank(cluster_id))` then `approach.step(rgb, depth, masks, centroids, pose)` | the gate's planner drives the approach (agent pitch 0) | the frame of the step just executed | the next action (`move_forward` / `turn_left` / `turn_right`) or `None` when committed |
-| `gate.finish_external_approach(request, step, approach.result, approach_log)`; `gate.remember_object(approach.object_points(), state)` | the approach ended | | the verdict (state `1`, `-1`, `2`) to return to the planner |
-| `EpisodeCollisionMap(sim).update(depth, moved_forward, position, yaw)` | every step (split navigation) | | the map `SplitNav` plans on (`.lmap`) |
-| `SplitNav().act(native_action, target, sim, pose_pf, gate, body_map)` | before executing a motion action | `target = {cluster_id, x, y, accepted, heading_to_object, log}`: the planner's current target and whether it is gate-accepted (or an undecided object it navigates to) | `(override action or None, info)`: an override replaces the planner's action, `None` keeps it; the planner's STOP is never overridden |
-| `gate.finish_episode()`, `gate.pop_events()` | episode end / per step | | counts, decision events for the step record |
+| `ZSONStep(cfg, camera, log_dir)` | once | `cfg` = `step.DEFAULTS` keys (`url`, `timeout_s`, `match_distance_m`, `view_bank`, `approach_max_per_object`, `approach_max_steps`, `approach_episode_steps`, `save_images`, ...); `camera` = `{hfov, width, height}` | pings the server; raises on a wrong URL or selector |
+| `start_episode(run_index, scene, episode_id, label, goal_object_ids, max_episode_steps, sim)` | episode start | `label` the target category | |
+| `observe(step, rgb, depth, pose, masks, scores, camera_pitch, semantic_instances=None)` | after every executed step (also during CONTROL) | the planner's **target-class** detections only | nothing |
+| `check(step, point, final=False, reporting=False, stalled=False, meta=None)` | the planner believes the target is at `point` | `final`: it is about to stop here (no approach possible); `reporting`: `point` is the GOTO point the step gave it and the planner reports back; `stalled`: its own navigation ended; `meta`: echoed in the log | `Verdict` |
+| `approach_ready()` | after `observe`, while a GOTO is out | | True when the GOTO object is now close and in view: the planner should check again (`reporting=True`) |
+| `act(step, rgb, depth, pose, masks)` | every step while CONTROL (camera level) | the frame of the step just executed | an action name (`move_forward` / `turn_left` / `turn_right`) or the final `Verdict` (ACCEPT, REJECT, DEFER) |
+| `end_approach(step)` | the episode ended during CONTROL | | the final `Verdict` |
+| `accepted_points()` | for `SplitNav` | | points of the objects an approach accepted |
+| `finish_episode()`, `pop_events()` | episode end / per step | | counts, decision events for the step record |
 
-The decision flow of a request: JEV judges only the uncertainty of the first frame; a sure frame is decided by SAM3's raw
-label; an unsure one makes the planner approach, and the gate's planner (`MppiV15` on the agent's own depth map) collects
-views (`decide.py`: JEV naming belief, new viewpoints only) until P(consistent) >= 0.8, then the fused SAM3 verdict over the
-nearest views (with the metric-size veto) accepts or rejects. No evidence is a deferral, never a verdict. After an accept the
-planner's own navigation (optionally split navigation) goes on to the object.
+`Verdict.kind`:
 
-## ApexNav wiring (`planners/ApexNav/habitat_evaluation.py`)
+| kind | meaning for the planner |
+|---|---|
+| `ACCEPT` | the target is verified: stop / go on to it |
+| `REJECT` | not the target (the object stays rejected: a later check of it is answered from memory) |
+| `DEFER` | no evidence yet (no object at the point): treat as a non-detection and keep exploring; a `final` check rejects |
+| `GOTO` | insufficient view: navigate toward `verdict.point` with the planner's own navigation (`camera` = where the unclear view was taken, `max_steps`); when `approach_ready()` or the navigation ends, call `check(..., reporting=True[, stalled=True])` |
+| `CONTROL` | the step's local planner takes over: level the camera, then `act` every step until it returns a Verdict |
 
-- `build_verification_gate`: one `VerificationGate` per run from the `verification:` config (`url: ${oc.env:VERIFIER_URL}`).
-- `execute_step`: `gate.observe` after every step with the planner's target detections; the reopened ids ride with the
-  `StepObservation` to the C++ planner (`sync_step`: the planner plans only after each step's inputs).
-- `run_episode`: a latched `VerificationRequest` -> `gate.handle`; state `3` -> `gate.approach_handoff` / `approach_close`
-  decide between ApexNav's own object navigation and `run_gate_approach` (a `LiveApproach` loop through `execute_step`
-  with `external_approach=True`); the verdict goes back as `VerificationResult`.
-- `NAV_SPLIT=true`: `run_split` builds `target` from the `StepAction` (`target_accepted`, `target_cluster_id`, `target_x/y`,
-  `final_state == SEARCH_OBJECT` with an object-search `expl_result`) and calls `SplitNav.act`; the episode collision map is fed in
-  `execute_step`. Sliding must be off.
-- Runs: `planners/ApexNav/scripts/run_pool.sh` (arms `baseline`, `split`), outputs in `planners/ApexNav/videos/<run>`; score
-  with `python -m nav.eval.closer_attrib` / `nav.eval.nav_table`.
+An object that already has a verdict answers from memory; an undecided object is judged on its most readable view
+(correct -> ACCEPT, wrong -> REJECT, insufficient -> GOTO if the object is far or out of view, else CONTROL; budgets:
+`approach_max_per_object`, `approach_max_steps`, `approach_episode_steps`, the episode limit; no budget, or `final` -> REJECT).
+An approach that finds no evidence (or gets stuck) ends in DEFER. Re-check of a rejected object (cooldown, novel view,
+`max_checks`) was dropped: the planner decides when to trigger, and the object answers from memory. Server errors raise.
 
-## Writing another adapter (e.g. VLFM)
+The decision flow in CONTROL: JEV judges only the uncertainty of the first frame; a sure frame is decided by SAM3's raw label;
+an unsure one makes `LiveApproach` (`MppiV15` on the agent's own depth map) collect views (`decide.py`: JEV naming belief, new
+viewpoints only) until P(consistent) >= 0.8, then the fused SAM3 verdict over the nearest views (with the metric-size veto).
 
-1. Map the planner's frames to the conventions above (pose, target masks and centroids, depth in metres).
-2. Hold the planner when it selects a candidate cluster, call `gate.handle`, apply the state (accept: stop / go on; reject and
-   defer: drop the candidate; approach: `approach_handoff` then `LiveApproach.step` until `None`).
-3. Call `gate.observe` after every step; forget the verdict of the ids it returns.
-4. Optionally call `SplitNav.act` before each motion action once the planner heads to a gate-accepted target.
+## ApexNav adapter (`planners/ApexNav/habitat_evaluation.py`)
+
+- `build_zson_step`: one `ZSONStep` per run from the `verification:` config (needs `sync_step`, the planner launched with
+  `verification_gate:=true verification_approach:=true sync_step:=true`; `scripts/run_gate_e2e.sh` does).
+- `execute_step`: `zson.observe` with the target-class detections (label 0) after every step; the cluster in `ctx["goto_cluster"]`
+  rides in `StepObservation.approach_view_cluster_ids` when `zson.approach_ready()` (the planner ends its native approach and
+  re-requests).
+- `run_episode` / `answer_request`: a `VerificationRequest` (cluster centroid) becomes `zson.check(step, centroid,
+  final=at_stop, reporting=approach_id > 0, stalled=viewpoint_status in (1, 2, 3), meta={cluster id, ...})`:
+
+  | verdict | `VerificationResult` |
+  |---|---|
+  | ACCEPT / REJECT / DEFER | state 1 / -1 / 2 |
+  | GOTO | state 3 with `{approach_id, object, camera, max_steps}`: ApexNav's object navigation approaches |
+  | CONTROL | `run_zson_control`: level the camera, `zson.act` through `execute_step(external_approach=True)`, then state 1 / -1 / 2 with `resume_step` |
+
+  The cluster id <-> object mapping lives in the adapter only (`meta` is echoed as `cluster` in `decisions.jsonl`; the planner's
+  records and `nav.eval.closer_attrib` read it there).
+- `NAV_SPLIT` (default true with the step): `run_split` builds the target from the `StepAction` and calls
+  `SplitNav.act(..., zson.accepted_points(), body_map)`; sliding must be off. `NAV_SPLIT=false` is the no-split ablation.
+- Runs: `planners/ApexNav/scripts/run_pool.sh <episodes> <arm>=<run>` with arms `zson` (step + split), `zson_nosplit` (step
+  only) and `baseline` (raw ApexNav, imports nothing from this repo). Outputs in `planners/ApexNav/videos/<run>`; score with
+  `python -m nav.eval.closer_attrib` / `nav.eval.nav_table`.
+
+## Adapter checklist (VLFM, `planners/VLFM`, the upstream fork, untouched so far)
+
+VLFM has no object clusters: its target is a point (best frontier / detected object position). That is why the step has its own
+object memory.
+
+1. Build one `ZSONStep` with the camera intrinsics, and call `start_episode` (with the simulator for the local planner).
+2. After every executed step call `observe` with the **target-class** masks and scores of VLFM's detector, the metric depth, the
+   agent pose `(x, y, yaw)` in VLFM's world frame and the camera pitch.
+3. When VLFM is about to commit to / stop at a detected target at world point `p`, call `check(step, p)` (`final=True` for the
+   stop itself). Hold VLFM's action until the verdict:
+   - ACCEPT: stop / go on; REJECT or DEFER: drop the candidate (VLFM keeps exploring; a rejected point is answered from
+     memory when it triggers again);
+   - GOTO: navigate toward `verdict.point` with VLFM's own navigation; after each step `observe`, then when
+     `approach_ready()` or the navigation ended call `check(step, p, reporting=True, stalled=ended)`;
+   - CONTROL: level the camera, then each step execute `act(...)`'s action and `observe`, until `act` returns a Verdict.
+4. Optionally call `SplitNav.act` before each motion action once VLFM heads for an accepted target.
 5. Provide `scene.agent_pose` / `scene.camera` for the simulator in use.
+
 Tests: `python -m unittest discover -s nav -t .` (core env, `PYTHONPATH` = repo root).
