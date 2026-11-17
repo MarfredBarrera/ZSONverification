@@ -36,13 +36,21 @@ class StepTests(unittest.TestCase):
                     "verdict": {"accepted": status == "correct", "label": "potted plant", "status": status,
                                 "source": "sam3" if status != "insufficient" else "jev"}}
 
+        self.found, self.detect_calls = [], []
+
+        def detect(url, rgb, target, words, min_score, request_id=None, timeout=None):
+            self.detect_calls.append((target, list(words), min_score))
+            return list(self.found)
+
         self.step = ZSONStep({"url": "http://x"}, {"hfov": 79, "width": W, "height": H}, self.folder, verify=verify,
-                             ping=lambda url, timeout: {"ok": True, "settings": {"selector": "jev_sam3"}})
+                             detect=detect, ping=lambda url, timeout: {"ok": True, "settings": {"selector": "jev_sam3"}})
         self.step.start_episode(7, "scene", "ep", "potted_plant", ["42"], 500, sim=None)
 
-    def observe(self, n, pose=(0.0, 0.0, 0.0), size=16, depth=2.0):
-        return self.step.observe(n, RGB, np.full((H, W), depth, np.float32), pose, [mask(size)], [0.5],
-                                 -math.radians(30), [[{"id": "42", "pixels": 10}]])
+    def observe(self, n, pose=(0.0, 0.0, 0.0), size=16, depth=2.0, found=None):
+        """One step: SAM3 finds a target of ``size`` px (or ``found``, a list of (word, score, mask))."""
+        self.found = [("potted plant", 0.5, mask(size))] if found is None else found
+        semantic = np.where(mask(size) > 0, 42, 0)
+        return self.step.observe(n, RGB, np.full((H, W), depth, np.float32), pose, -math.radians(30), True, semantic)
 
     def decisions(self):
         with open(os.path.join(self.folder, "decisions.jsonl"), encoding="utf-8") as stream:
@@ -51,6 +59,33 @@ class StepTests(unittest.TestCase):
     def test_target_name(self):
         self.assertEqual(target_name("potted_plant"), "potted plant")
         self.assertEqual(target_name("table | dining table | desk"), "table")
+
+    def test_sam3_runs_only_on_flagged_frames_or_in_control(self):
+        self.found = [("potted plant", 0.5, mask())]
+        args = (RGB, DEPTH, (0.0, 0.0, 0.0), 0.0)
+        self.step.observe(1, *args, False)
+        self.assertEqual((self.detect_calls, self.step.objects, self.step.last["masks"]), ([], [], []))
+        self.step.observe(2, *args, True)
+        self.assertEqual((len(self.detect_calls), len(self.step.objects)), (1, 1))
+        self.step.control = self.step.objects[0]        # CONTROL drives: every frame, whatever the flag
+        self.step.observe(3, *args, False)
+        self.assertEqual((len(self.detect_calls), self.step.finish_episode()["sam3_frames"]), (2, 2))
+
+    def test_own_detection_prompts_and_non_target_objects(self):
+        other = ("chair", 0.6, mask(10))      # a look-alike 2 m ahead: a non-target object, not evidence
+        self.observe(1, found=[("potted plant", 0.5, mask(16)), other])
+        self.assertEqual(self.detect_calls[0], ("potted plant", ["potted plant", "chair", "couch", "bed", "toilet", "tv"], 0.3))
+        self.assertEqual((len(self.step.objects), len(self.step.others), len(list(self.step.evidence))), (1, 1, 1))
+        self.assertEqual(self.step.last["masks"][0].sum(), mask(16).sum())      # only target instances
+        self.assertEqual(self.step.evidence.__iter__().__next__()["semantic_instances"][0]["id"], "42")
+
+    def test_non_target_object_blocks_a_view_nearer_it(self):
+        chair = np.zeros((H, W), np.uint8)
+        chair[H // 2 - 2:H // 2 + 2, W // 2 + 6:W // 2 + 10] = 1      # ~0.4 m beside the plant
+        self.observe(1, found=[("potted plant", 0.5, mask(16)), ("chair", 0.6, chair)])
+        view, plant = next(iter(self.step.evidence)), self.step.objects[0]
+        self.assertTrue(self.step._closer_to_other(view, plant, 0.5))     # the chair is nearer than 0.5 m ...
+        self.assertFalse(self.step._closer_to_other(view, plant, 0.1))    # ... but not nearer than 0.1 m
 
     def test_centroid_and_association(self):
         self.observe(1)                                   # 2 m ahead of the origin
@@ -115,7 +150,7 @@ class StepTests(unittest.TestCase):
         self.statuses.append("insufficient")
         self.observe(1)                                   # the object 2 m ahead
         point = self.step.objects[0]["centroid"]
-        self.step.observe(2, RGB, DEPTH, (-8.0, 0.0, 0.0), [], [], 0.0)       # the agent is far away now
+        self.observe(2, (-8.0, 0.0, 0.0), found=[])       # the agent is far away now
         verdict = self.step.check(2, point)
         self.assertEqual((verdict.kind, verdict.approach_id, verdict.camera), (GOTO, 1, (0.0, 0.0)))
         self.assertEqual(self.step.check(4, point, reporting=True).kind, GOTO)          # still far: the planner goes on
@@ -133,7 +168,7 @@ class StepTests(unittest.TestCase):
         self.statuses.append("insufficient")
         self.observe(1)
         point = self.step.objects[0]["centroid"]
-        self.step.observe(2, RGB, DEPTH, (-8.0, 0.0, 0.0), [], [], 0.0)
+        self.observe(2, (-8.0, 0.0, 0.0), found=[])
         self.step.check(2, point)
         self.assertEqual(self.step.check(30, point, reporting=True, stalled="arrived").kind, CONTROL)
         self.assertEqual(self.step.finish_episode()["approach_arrived"], 1)
@@ -150,14 +185,18 @@ class StepTests(unittest.TestCase):
         live.object_points.return_value = np.zeros((5, 3))
         live.log_dir = None
         with mock.patch("nav.gate.approach.LiveApproach", return_value=live) as cls:
-            self.assertEqual(self.step.act(3, RGB, DEPTH, (0.0, 0.0, 0.0), [mask()]), "turn_left")
-            out = self.step.act(4, RGB, DEPTH, (0.0, 0.0, 0.0), [mask()])
+            self.observe(3)
+            with self.assertRaises(RuntimeError):   # act needs observe on the same frame
+                self.step.act(4, RGB, DEPTH, (0.0, 0.0, 0.0))
+            self.assertEqual(self.step.act(3, RGB, DEPTH, (0.0, 0.0, 0.0)), "turn_left")
+            self.observe(4)
+            out = self.step.act(4, RGB, DEPTH, (0.0, 0.0, 0.0))
         self.assertEqual(out.kind, ACCEPT)
         self.assertEqual(cls.call_args.kwargs["bank"], self.step.objects[0]["bank"])
         self.assertEqual(len(self.step.accepted_points()), 1)
         self.assertEqual(self.decisions()[-2]["cluster"], {"id": 6})         # the approach's decision keeps the request
-        with self.assertRaises(RuntimeError):
-            self.step.act(5, RGB, DEPTH, (0.0, 0.0, 0.0), [])
+        with self.assertRaises(RuntimeError):   # no CONTROL any more
+            self.step.act(5, RGB, DEPTH, (0.0, 0.0, 0.0))
 
     def test_reporting_without_an_approach_raises(self):
         self.observe(1)
@@ -204,7 +243,7 @@ class StepTests(unittest.TestCase):
         self.statuses.append("insufficient")
         self.observe(1)
         self.observe(2, (0.0, 0.0, 0.0), size=24)
-        self.step.observe(3, RGB, DEPTH, (-8.0, 0.0, 0.0), [], [], 0.0)
+        self.observe(3, (-8.0, 0.0, 0.0), found=[])
         verdict = self.step.check(3, self.step.objects[0]["centroid"])
         self.assertEqual(verdict.kind, GOTO)
         self.assertEqual(len(self.step.objects[0]["bank"]), 2)
@@ -227,7 +266,7 @@ class SameObjectTest(unittest.TestCase):
                         ping=lambda url, timeout: {"settings": {"selector": "jev_sam3"}})
         step.start_episode(1, "s", "e", "chair", [], 500, sim=None)
         step.decided.append((S.backproject(depth, box, *cam), REJECT))
-        step.last = {"depth": depth, "masks": [box.astype(np.uint8)], "centroids": [(2.0, 0.0)],
+        step.last = {"step": 1, "depth": depth, "masks": [box.astype(np.uint8)], "centroids": [(2.0, 0.0)],
                      "pose": (0.0, 0.0, 0.0)}
         with mock.patch("nav.approach.scene.camera", return_value=cam):
             self.assertEqual(step.check(5, (2.0, 0.0)).kind, REJECT)

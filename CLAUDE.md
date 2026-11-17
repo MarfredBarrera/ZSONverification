@@ -57,7 +57,7 @@ reusable plots, and all images, angles, and scores stored in the study database.
   evaluates it on ApexNav's false-positive episodes. `python -m perception.server`
   serves one `Verifier` over HTTP (port 8772 for the ObjectNav runs, `--selector jev_sam3`).
 - `nav/` is the planner-agnostic **ZSON verification step** (no ROS, no planner imports): `nav/gate/step.py`
-  (`ZSONStep`: own object memory from the planner's target masks + depth + pose, verdicts ACCEPT / REJECT / DEFER / GOTO /
+  (`ZSONStep`: own SAM3 detection + object memory from RGB + depth + pose, verdicts ACCEPT / REJECT / DEFER / GOTO /
   CONTROL, `LiveApproach` for CONTROL), `nav/approach` (MPPI approach planner, decision flow), `nav/lastmile` (optional,
   separate: split navigator, medial planner, episode collision map), `nav/eval` (run-format scoring). `nav/README.md` is the
   interface, the ApexNav adapter mapping and the VLFM adapter checklist. Tests live next to the code:

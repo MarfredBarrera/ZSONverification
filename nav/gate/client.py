@@ -62,3 +62,15 @@ def verify(url, rgb, mask, target, input_elevation=0.0, vocabulary=None, request
     if not reply.get("ok"):
         raise RuntimeError(f"perception server: {reply.get('error')}")
     return reply
+
+
+def detect(url, rgb, target, words, min_score, request_id=None, timeout=120.0):
+    """POST /detect: the SAM3 instances of ``target`` and ``words`` in a frame scoring >= ``min_score``.
+    -> [(word, score, mask HxW uint8 0/1)], best first per word. Raises on transport or server errors."""
+    payload = {"protocol": PROTOCOL, "request_id": request_id, "target": target, "words": list(words),
+               "min_score": float(min_score), "image": encode_png(cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR))}
+    reply = _call(url, "/detect", payload, timeout=timeout)
+    if not reply.get("ok"):
+        raise RuntimeError(f"perception server /detect: {reply.get('error')}")
+    return [(c["word"], float(c["score"]), (cv2.cvtColor(decode_png(c["mask"]), cv2.COLOR_RGB2GRAY) > 127).astype(np.uint8))
+            for c in reply["candidates"]]

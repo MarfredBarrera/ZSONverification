@@ -1,19 +1,22 @@
 """ZSONStep: the planner-agnostic verification step (no ROS, no planner imports; see nav/README.md).
 
-The planner keeps its exploration, its detector and its navigation. The step owns everything about *whether a candidate
-detection is the target*: an object memory built from the planner's target-class masks, the verdicts, the evidence and
-the approach that gets a clearer view first.
+The planner keeps its exploration, its detector (which decides when it asks for a check) and its navigation. It gives the
+step only RGB, depth, pose and the camera intrinsics every step, one boolean (its detector sees the target), and the trigger point. The step owns everything about
+*whether a candidate detection is the target*: its own SAM3 detection of the frames where the planner's detector sees the target (Verifier server /detect), an object
+memory built from it, the verdicts, the evidence and the approach that gets a clearer view first.
 
     step = ZSONStep(cfg, camera, log_dir)
     step.start_episode(run_index, scene, episode_id, label, goal_object_ids, max_episode_steps, sim)
-    reopened = step.observe(step, rgb, depth, pose, masks, scores, camera_pitch)   # after every executed step
+    reopened = step.observe(step, rgb, depth, pose, camera_pitch, target_seen)   # after every executed step
     verdict = step.check(step, point)           # the planner believes the target is at world point (x, y)
     ... verdict.kind: ACCEPT | REJECT | DEFER | GOTO | CONTROL
-    out = step.act(step, rgb, depth, pose, masks)   # while CONTROL: an action name, or the final Verdict
+    out = step.act(step, rgb, depth, pose)   # while CONTROL: an action name, or the final Verdict
     counts = step.finish_episode()
 
-Objects: every target-class detection gets a world centroid (mask + depth + pose) and joins the nearest object within
-``match_distance_m`` (else it opens one; an object's centroid is the mean of its detections). The views are kept in one
+Objects: every SAM3 instance of the target (score >= DETECT_MIN_SCORE) gets a world centroid (mask + depth + pose) and
+joins the nearest object within ``match_distance_m`` (else it opens one; an object's centroid is the mean of its
+detections). Instances of the other goal categories (GOAL_WORDS) are non-target objects: positions only, they make views
+nearer another object not count. The views are kept in one
 ``EvidenceStore`` (per 0.75 m cell), each with a snapshot of the objects' centroids at its step; an object keeps its verdict
 state, the views it used, its checks and its view bank. A check resolves the point to the nearest object within twice
 ``match_distance_m`` and judges the most readable view of it (preferring views that are new since its last check) with the
@@ -44,7 +47,7 @@ import numpy as np
 
 from nav.gate import client
 from nav.gate.evidence import MATCH_DISTANCE_M, EvidenceStore, mask_touches_border, view_quality
-from nav.gate.ground_truth import semantic_goal_overlap, slugify_label
+from nav.gate.ground_truth import semantic_goal_overlap, semantic_instances, slugify_label
 
 DEFAULTS = {
     "url": None,                     # the Verifier server (perception.server --selector jev_sam3); required
@@ -67,6 +70,11 @@ DEFAULTS = {
     "save_images": True,
     "ground_truth_semantic_overlap": 0.5,
 }
+# The step's own SAM3 detection (server /detect, once per observed frame): the target plus the other HM3D goal categories
+# (their instances are non-target objects of the memory), kept when SAM3 scores them >= DETECT_MIN_SCORE (the approach's
+# own detection threshold).
+GOAL_WORDS = ("chair", "couch", "bed", "toilet", "tv", "potted plant")
+DETECT_MIN_SCORE = 0.3
 ACCEPT, REJECT, DEFER, GOTO, CONTROL = "ACCEPT", "REJECT", "DEFER", "GOTO", "CONTROL"
 STATES = {ACCEPT: 1, REJECT: -1, DEFER: 2, GOTO: 3, CONTROL: 3}   # as logged (the planner's verification states)
 COUNT = {ACCEPT: "accepted", REJECT: "rejected", DEFER: "deferred"}
@@ -110,7 +118,7 @@ def _angle_between(a, b):
 class ZSONStep:
     """``camera``: {hfov, width, height} of the planner's depth / RGB sensor (logged with every decision)."""
 
-    def __init__(self, cfg, camera, log_dir, verify=None, ping=None):
+    def __init__(self, cfg, camera, log_dir, verify=None, ping=None, detect=None):
         unknown = set(cfg or {}) - set(DEFAULTS)
         if unknown:
             raise ValueError(f"unknown verification settings: {sorted(unknown)}")
@@ -120,6 +128,7 @@ class ZSONStep:
         self.camera, self.log_dir = camera, log_dir
         self.fx = camera["width"] / (2 * math.tan(camera["hfov"] * np.pi / 360.0))
         self._verify = verify or client.verify
+        self._detect = detect or client.detect
         self.server = (ping or client.ping)(self.cfg["url"], timeout=float(self.cfg["ping_timeout_s"]))
         selector = (self.server.get("settings") or {}).get("selector")
         if selector != "jev_sam3":
@@ -138,6 +147,7 @@ class ZSONStep:
                         "label": str(label), "target": target_name(label),
                         "goal_object_ids": [str(i) for i in goal_object_ids if i is not None]}
         self.objects, self.events, self.last = [], [], None
+        self.others = []           # non-target objects (other goal categories): positions only, for the view rules
         self.evidence = EvidenceStore(self.cfg["match_distance_m"], self.cfg["evidence_per_cell"],
                                       self.cfg["max_evidence"])
         self.verdicts = {}         # (step, index) of a judged view -> the server's verdict
@@ -149,7 +159,7 @@ class ZSONStep:
             "requests", "accepted", "rejected", "deferred", "no_evidence", "cached", "reopened", "same_object",
             "insufficient", "moves", "approach_early", "approach_arrived", "approach_failed", "approach_accepted",
             "approach_rejected", "approach_undecided", "approach_exhausted", "approach_steps", "sam3_decisions",
-            "jev_decisions")}
+            "jev_decisions", "sam3_frames")}
 
     def finish_episode(self):
         return dict(self.counts)
@@ -177,43 +187,61 @@ class ZSONStep:
         c, s = math.cos(pose[2]), math.sin(pose[2])
         return (float(np.mean(c * z + s * lateral)) + float(pose[0]), float(np.mean(s * z - c * lateral)) + float(pose[1]))
 
-    def observe(self, step, rgb, depth, pose, masks, scores, camera_pitch, semantic_instances=None):
-        """Store this step's target-class detections. ``pose`` (x, y, yaw) in the planner's world frame, ``depth`` in
-        metres (H x W), ``masks`` / ``scores`` / ``semantic_instances`` one entry per detection. Returns the objects the
-        re-check rule reset to unverified: [{"object": id, "point": (x, y)}] (none while CONTROL drives)."""
+    def observe(self, step, rgb, depth, pose, camera_pitch, target_seen, semantic=None):
+        """The frame of the step just executed: ``rgb`` (H x W x 3 uint8), ``depth`` in metres (H x W), ``pose`` (x, y,
+        yaw) in the planner's world frame. ``target_seen``: the planner's own detector reports a target-class detection
+        in this frame (the one planner input besides the frame; its masks are not used). The step runs SAM3 on the frame
+        (server /detect: the target and the other goal categories) when ``target_seen`` or while CONTROL drives, stores
+        the target instances as evidence and every other instance as a non-target object; other frames only update
+        ``last``. ``semantic`` (scene instance ids, H x W) is for ground-truth logging only. Returns the objects the re-check
+        rule reset to unverified: [{"object": id, "point": (x, y)}] (none while CONTROL drives)."""
         depth = np.asarray(depth, np.float32)
-        centroids, new = [], []
-        for index, raw in enumerate(masks):
-            mask = (np.asarray(raw).squeeze() > 0).astype(np.uint8)
+        target = self.episode["target"]
+        found = []
+        if target_seen or self.control is not None:
+            found = self._detect(self.cfg["url"], rgb, target, [target, *[w for w in GOAL_WORDS if w != target]],
+                                 DETECT_MIN_SCORE, request_id=f"det_{self.episode['run_index']}_{int(step)}",
+                                 timeout=float(self.cfg["timeout_s"]))
+            self.counts["sam3_frames"] += 1
+        masks, centroids, new = [], [], []
+        for word, score, mask in found:
             area = int(mask.sum())
             centroid = self._centroid(depth, mask, pose) if area else None
+            if word != target:
+                if centroid is not None:
+                    self._associate(self.others, centroid)
+                continue
+            masks.append(mask)
             centroids.append(centroid)
             if centroid is None:
                 continue
-            score = float(scores[index])
-            self._associate(centroid)
-            new.append({"step": int(step), "index": index, "rgb": rgb, "mask": mask, "score": score,
+            self._associate(self.objects, centroid)
+            new.append({"step": int(step), "index": len(masks) - 1, "rgb": rgb, "mask": mask, "score": score,
                         "area_fraction": area / float(mask.size),
                         "quality": view_quality(score, area / float(mask.size), mask_touches_border(mask)),
                         "centroid": centroid, "camera": (float(pose[0]), float(pose[1])), "pitch": float(camera_pitch),
-                        "semantic_instances": None if semantic_instances is None else semantic_instances[index]})
-        snapshot = {o["id"]: o["centroid"] for o in self.objects}   # the objects as they stand at this step
+                        "semantic_instances": semantic_instances(semantic, mask)})
+        snapshot = {o["id"]: o["centroid"] for o in (*self.objects, *self.others)}   # the objects as they stand now
         for view in new:
             view["objects"] = snapshot
             self.evidence.add(view)
         self._bank_views(new)
-        self.last = {"depth": depth, "masks": list(masks), "centroids": centroids, "pose": pose}
+        self.last = {"step": int(step), "depth": depth, "masks": masks, "centroids": centroids, "pose": pose}
         if self.control is not None:   # CONTROL drives: evidence only, no reopens and no approach views
             return []
         self._approach_views(step, new)
         return self._reopen(step, new, snapshot)
 
-    def _associate(self, centroid):
-        near = [o for o in self.objects if _distance(o["centroid"], centroid) <= self.cfg["match_distance_m"]]
+    def _associate(self, objects, centroid):
+        """Join ``centroid`` to the nearest of ``objects`` within ``match_distance_m``, else open one. Target objects
+        (``self.objects``) carry the verdict state; ``self.others`` only a position."""
+        near = [o for o in objects if _distance(o["centroid"], centroid) <= self.cfg["match_distance_m"]]
         if not near:
-            self.objects.append({"id": len(self.objects), "centroid": centroid, "n": 1, "state": None, "checks": 0,
-                                 "last_step": 0, "point": centroid, "used": [], "approaches": 0, "pending": None,
-                                 "bank": []})
+            obj = {"id": len(objects) if objects is self.objects else f"o{len(objects)}", "centroid": centroid, "n": 1}
+            if objects is self.objects:
+                obj.update(state=None, checks=0, last_step=0, point=centroid, used=[], approaches=0, pending=None,
+                           bank=[])
+            objects.append(obj)
             return
         obj = min(near, key=lambda o: _distance(o["centroid"], centroid))
         obj["centroid"] = tuple((a * obj["n"] + b) / (obj["n"] + 1) for a, b in zip(obj["centroid"], centroid))
@@ -540,8 +568,8 @@ class ZSONStep:
               f"{stalled or 'close'} after {pending['native']} steps -> {PLANNER}")
         return self._approach_verdict(obj, CONTROL)
 
-    def act(self, step, rgb, depth, pose, masks):
-        """While CONTROL (the camera level, pitch 0): the frame of the step just executed -> the next action
+    def act(self, step, rgb, depth, pose):
+        """While CONTROL (the camera level, pitch 0): the frame of the step just executed (``observe`` has seen it) -> the next action
         (``move_forward`` / ``turn_left`` / ``turn_right``), or the final Verdict (ACCEPT, REJECT, DEFER) once the
         approach commits."""
         from nav.gate.approach import LiveApproach
@@ -556,9 +584,9 @@ class ZSONStep:
                 min(max(pending["max_steps"] - pending["native"], MIN_PLANNER_STEPS),
                     self.max_episode_steps - 1 - int(step)),
                 PLANNER, log_dir=os.path.join(self.log_dir, "approach", tag), tag=tag, bank=self.control["bank"])
-        depth = np.asarray(depth, np.float32)
-        centroids = [self._centroid(depth, (np.asarray(m).squeeze() > 0).astype(np.uint8), pose) for m in masks]
-        name = self.live.step(rgb, depth, masks, centroids, pose)
+        if self.last is None or self.last["step"] != int(step):
+            raise RuntimeError(f"act() at step {step} needs observe() on the same frame")
+        name = self.live.step(rgb, np.asarray(depth, np.float32), self.last["masks"], self.last["centroids"], pose)
         return name if name is not None else self._finish(step)
 
     def end_approach(self, step):
