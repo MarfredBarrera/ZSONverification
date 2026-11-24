@@ -52,6 +52,19 @@ def decode_png(text):
     return cv2.cvtColor(cv2.imdecode(data, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
 
+def detect(url, rgb, target, min_score=0.3, request_id=None, timeout=60.0):
+    """POST /detect: SAM3 instances of ``target`` in ``rgb`` (look-alike words dropped), best first:
+    [(mask HxW bool, score)]. Raises on transport or server errors."""
+    payload = {"request_id": request_id, "target": target, "min_score": float(min_score),
+               "image": encode_png(cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR))}
+    reply = _call(url, "/detect", payload, timeout=timeout)
+    if not reply.get("ok"):
+        raise RuntimeError(f"perception server: {reply.get('error')}")
+    found = [(cv2.imdecode(np.frombuffer(base64.b64decode(c["mask"]), np.uint8), cv2.IMREAD_GRAYSCALE) > 0,
+              float(c["score"])) for c in reply["candidates"] if c["word"] == target]
+    return sorted(found, key=lambda item: -item[1])
+
+
 def verify(url, rgb, mask, target, input_elevation=0.0, vocabulary=None, request_id=None, timeout=120.0):
     """POST /verify; returns {ok, verdict, view_image}. Raises on transport or server errors."""
     payload = {"protocol": PROTOCOL, "request_id": request_id, "target": target,

@@ -1,0 +1,19 @@
+/opt/src/fast-sam3d
+[SPARSE][CONV] spconv algo: auto
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA L40S" (44 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /data/cache/warp/1.17.0
+[]
+[]
+Traceback (most recent call last):
+  File "/workspace/outputs/apexnav_online/d1_smoke_2026-11-03/stagger_check/_sam3d_offload.py", line 25, in <module>
+    out["modules"] = [n for n, _ in _gpu_state(m)]
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/outputs/apexnav_online/d1_smoke_2026-11-03/stagger_check/_sam3d_offload.py", line 25, in <listcomp>
+    out["modules"] = [n for n, _ in _gpu_state(m)]
+                            ^^^^
+ValueError: too many values to unpack (expected 2)

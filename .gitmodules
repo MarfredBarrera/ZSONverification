@@ -6,3 +6,7 @@
 	path = planners/VLFM
 	url = https://github.com/MarfredBarrera/vlfm
 	branch = main
+[submodule "planners/StopWatch"]
+	path = planners/StopWatch
+	url = https://github.com/amazon-far/stopwatch.git
+	branch = main

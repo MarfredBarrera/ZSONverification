@@ -69,6 +69,11 @@ reusable plots, and all images, angles, and scores stored in the study database.
   Its compose file mounts this repo at `/workspace/ZSONverification` (on `PYTHONPATH`).
   Run outputs go to `planners/ApexNav/videos/<run>` (not tracked).
   `planners/VLFM` (fork MarfredBarrera/vlfm, remote `upstream` = rai-opensource/vlfm; no hooks yet) goes the same way.
+  `planners/StopWatch` (amazon-far/stopwatch, branch `zson`; learned Qwen3-VL perception + policy) runs in its own
+  container (`docker/compose.yaml`, `SW_GPU`). The zson branch replaces FlashAttention 4 (Hopper/Blackwell only) with SDPA
+  for the L40S, and `stopwatch/eval/zson.py` puts the gate on its grounding text (opt-in via `$ZSON_VERIFIER_URL`). Runs:
+  `scripts/run_pool.sh zson=<run> raw=<run>` (the ApexNav ovon_split200 episodes in StopWatch's clean set, 155), outputs
+  in `planners/StopWatch/outputs/<run>`; eval data and HF cache in `/ICONAS/users/marfred/stopwatch_data`.
 - `python -m study --config configs/<name>.yaml` runs render -> reconstruct ->
   score -> pick -> detect -> analyze. Stages resume. Outputs are in `outputs/<study>/`,
   with `study.sqlite` as the source of truth. See README.md. `outputs/` and

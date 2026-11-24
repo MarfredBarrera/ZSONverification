@@ -7,6 +7,7 @@ guide. ``MppiV15().reset(ctx); action = MppiV15().act(Observation)`` -> "move_fo
 or None (stop: no rollout beats staying here).
 """
 import math
+import os
 
 import numpy as np
 
@@ -127,7 +128,7 @@ class MppiV15:
         from nav.approach.closer import Closer
         self.prev = None          # (position, yaw, action) of the last call: bump detection
         self.last = None
-        self.rng = np.random.default_rng(0)
+        self.rng = np.random.default_rng(int(os.environ.get("SEED") or 0))  # SEED: the evaluation seed (default 0 = the split2 runs)
         self.done = False
         self.vox = None
         self.top_seen, self.bot_seen, self.top_cut, self.bot_cut = False, False, False, False

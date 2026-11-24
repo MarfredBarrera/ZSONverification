@@ -4,7 +4,9 @@ Everything an ObjectNav planner needs to put the Verifier in its loop, with no R
 keeps its exploration and its own detector; this package decides **whether a candidate detection is the target**
 (accept / reject / defer), drives the **approach** to get a better view when the first one is insufficient, and
 optionally replaces the planner's motion toward an accepted target (**split navigation**). ApexNav is the first
-adapter (`planners/ApexNav`, `habitat_evaluation.py`); a VLFM adapter implements the same calls.
+adapter (`planners/ApexNav`, `habitat_evaluation.py`); VLFM (`vlfm/policy/zson_adapter.py`) and StopWatch
+(`stopwatch/eval/zson.py`, gating the learned policy's grounding text) implement the same calls. Planners without object
+clusters of their own use `nav/gate/clusters.py`; `client.detect` gives them SAM3 target masks.
 
 ```
 nav/gate      client.py (HTTP to perception.server), evidence.py, gate.py (VerificationGate), approach.py (LiveApproach),

@@ -7,3 +7,4 @@ __pycache__/
 build-logs/
 # Written into the cwd by Fast-SAM3D (fft/fft3d.py) on every reconstruction.
 visualization/
+weights/

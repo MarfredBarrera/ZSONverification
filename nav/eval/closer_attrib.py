@@ -3,7 +3,7 @@
   python3 -m nav.eval.closer_attrib ARM [ARM ...] --episodes FILE [--per-episode OUT.tsv]
             [--cand all|confident] [--min-goal-px N] [--merge-m 1.0]
 
-ARM is NAME=run1+run2 (run dirs under planners/ApexNav/videos; the first run holding an episode
+ARM is NAME=run1+run2 (run dirs under --root, default planners/ApexNav/videos; the first run holding an episode
 wins; an episode counts only once its episodes.jsonl has a final line with "result").
 
 Every failed episode (Habitat success == 0) gets exactly one cause, in CLOSER's priority order
@@ -42,9 +42,9 @@ def jl(path):
     return out
 
 
-def find_episode(runs, ep):
+def find_episode(runs, ep, root=V):
     for run in runs:
-        for d in glob.glob(f"{V}{run}/*/epi{ep}"):
+        for d in glob.glob(f"{root}{run}/*/epi{ep}"):
             rows = jl(d + "/episodes.jsonl")
             if rows and "result" in rows[-1]:
                 return run, d, rows[-1]
@@ -181,18 +181,22 @@ def main():
                          "confident: only clusters that became confident or reached the gate")
     ap.add_argument("--ledger", action="store_true",
                     help="report-only: confusion of automatic cause vs eye label in labels/ledger.tsv (never an input)")
+    ap.add_argument("--root", default=V, help="runs root (default planners/ApexNav/videos; VLFM: planners/VLFM/outputs)")
     ap.add_argument("--min-goal-px", type=int, default=0, help="min summed goal pixels for a true cluster")
     ap.add_argument("--merge-m", type=float, default=1.0, help="dedupe radius for rejected clusters near a live true one")
+    ap.add_argument("--success-m", type=float, help="success = STOP with Habitat distance_to_goal <= this (e.g. 1.0) instead of Habitat's own flag")
     a = ap.parse_args()
+    root = a.root.rstrip('/') + '/'
     eps = [int(x) for x in open(a.episodes).read().split()]
     R = {}
     for arm in a.arms:
         name, runs = arm.split("=", 1)
         R[name] = {}
         for ep in eps:
-            f = find_episode(runs.split("+"), ep)
+            f = find_episode(runs.split("+"), ep, root)
             if f:
-                res = analyse(f[1], f[2], a.cand, a.min_goal_px, a.merge_m)
+                E = f[2] if a.success_m is None else dict(f[2], success=f[2].get("final_state") == STOP and f[2]["distance_to_goal"] <= a.success_m)
+                res = analyse(f[1], E, a.cand, a.min_goal_px, a.merge_m)
                 res["run"] = f[0]
                 R[name][ep] = res
     print(f"episodes file: {a.episodes} ({len(eps)} ids); cand={a.cand} min_goal_px={a.min_goal_px} merge_m={a.merge_m}")
